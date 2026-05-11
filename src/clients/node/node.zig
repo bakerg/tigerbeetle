@@ -24,11 +24,15 @@ pub const std_options: std.Options = .{
     .logFn = tb_client.exports.Logging.application_logger,
 };
 
-// Cached value for JS (null).
-var napi_null: c.napi_value = undefined;
+const NodeClient = struct {
+    interface: tb_client.ClientInterface,
+    request_error_ctor_ref: c.napi_ref,
+};
 
-// Cached `RequestError` constructor.
-var request_error_ctor_ref: c.napi_ref = undefined;
+const RequestContext = struct {
+    callback_ref: c.napi_ref,
+    request_error_ctor_ref: c.napi_ref,
+};
 
 // Must be kept in sync with `index.ts`.
 const ErrorCodes = enum {
@@ -41,8 +45,6 @@ const ErrorCodes = enum {
 
 /// N-API will call this constructor automatically to register the module.
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi_value {
-    napi_null = translate.capture_null(env) catch return null;
-
     translate.register_function(env, exports, "init", init) catch return null;
     translate.register_function(env, exports, "deinit", deinit) catch return null;
     translate.register_function(env, exports, "submit", submit) catch return null;
@@ -70,18 +72,7 @@ fn init(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     ) catch return null;
     assert(request_error_ctor != null);
 
-    translate.create_reference(
-        env,
-        request_error_ctor,
-        // Weak reference: type and symbol references are never
-        // GCed and cannot be deleted during cleanup.
-        .weak,
-        &request_error_ctor_ref,
-        "Cannot reference the object constructor",
-    ) catch return null;
-    assert(request_error_ctor_ref != null);
-
-    return create(env, cluster, addresses) catch null;
+    return create(env, cluster, addresses, request_error_ctor) catch null;
 }
 
 fn deinit(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
@@ -147,6 +138,7 @@ fn create(
     env: c.napi_env,
     cluster_id: u128,
     addresses: []const u8,
+    request_error_ctor: c.napi_value,
 ) !c.napi_value {
     var tsfn_name: c.napi_value = undefined;
     if (c.napi_create_string_utf8(env, "tb_client", c.NAPI_AUTO_LENGTH, &tsfn_name) != c.napi_ok) {
@@ -181,16 +173,28 @@ fn create(
         std.log.warn("Failed to release allocated thread-safe function on error.", .{});
     };
 
-    const client = global_allocator.create(tb_client.ClientInterface) catch {
+    const client = global_allocator.create(NodeClient) catch {
         return translate.throw(env, .{
             .message = "Failed to allocated the client interface.",
         });
     };
     errdefer global_allocator.destroy(client);
 
+    try translate.create_reference(
+        env,
+        request_error_ctor,
+        .strong,
+        &client.request_error_ctor_ref,
+        "Cannot reference the object constructor",
+    );
+    assert(client.request_error_ctor_ref != null);
+    errdefer translate.delete_reference(env, client.request_error_ctor_ref) catch {
+        std.log.warn("Failed to delete RequestError constructor reference on error.", .{});
+    };
+
     tb_client.init(
         global_allocator,
-        client,
+        &client.interface,
         cluster_id,
         addresses,
         @intFromPtr(completion_tsfn),
@@ -215,7 +219,7 @@ fn create(
             .message = "Unexpected error occurred on Client.",
         }),
     };
-    errdefer client.deinit() catch unreachable;
+    errdefer client.interface.deinit() catch unreachable;
 
     return try translate.create_external(env, client);
 }
@@ -227,14 +231,21 @@ fn destroy(env: c.napi_env, context: c.napi_value) !void {
         context,
         "Failed to get client context pointer.",
     );
-    const client: *tb_client.ClientInterface = @ptrCast(@alignCast(client_ptr.?));
+    const client: *NodeClient = @ptrCast(@alignCast(client_ptr.?));
     defer {
-        client.deinit() catch unreachable;
+        client.interface.deinit() catch unreachable;
+        translate.delete_reference(env, client.request_error_ctor_ref) catch {
+            std.log.warn("Failed to delete RequestError constructor reference.", .{});
+        };
         global_allocator.destroy(client);
     }
 
-    const completion_ctx = client.completion_context() catch |err| switch (err) {
-        error.ClientInvalid => return request_error(env, .ERR_CLIENT_CLOSED),
+    const completion_ctx = client.interface.completion_context() catch |err| switch (err) {
+        error.ClientInvalid => return request_error(
+            env,
+            client.request_error_ctor_ref,
+            .ERR_CLIENT_CLOSED,
+        ),
     };
     const completion_tsfn: c.napi_threadsafe_function = @ptrFromInt(completion_ctx);
     if (c.napi_release_threadsafe_function(completion_tsfn, c.napi_tsfn_release) != c.napi_ok) {
@@ -256,7 +267,14 @@ fn request(
         context,
         "Failed to get client context pointer.",
     );
-    const client: *tb_client.ClientInterface = @ptrCast(@alignCast(client_ptr.?));
+    const client: *NodeClient = @ptrCast(@alignCast(client_ptr.?));
+
+    const request_context = global_allocator.create(RequestContext) catch {
+        return translate.throw(env, .{
+            .message = "Failed to allocated a new request context.",
+        });
+    };
+    errdefer global_allocator.destroy(request_context);
 
     // Create a reference to the callback so it stay alive until the packet completes.
     var callback_ref: c.napi_ref = undefined;
@@ -271,6 +289,28 @@ fn request(
         std.log.warn("Failed to delete reference to callback on error.", .{});
     };
 
+    const request_error_ctor = translate.reference_value(
+        env,
+        client.request_error_ctor_ref,
+        "Failed to get RequestError constructor from reference.",
+    ) catch |err| return err;
+    var request_error_ctor_ref: c.napi_ref = undefined;
+    try translate.create_reference(
+        env,
+        request_error_ctor,
+        .strong,
+        &request_error_ctor_ref,
+        "Cannot reference the object constructor",
+    );
+    errdefer translate.delete_reference(env, request_error_ctor_ref) catch {
+        std.log.warn("Failed to delete RequestError constructor reference on error.", .{});
+    };
+
+    request_context.* = .{
+        .callback_ref = callback_ref,
+        .request_error_ctor_ref = request_error_ctor_ref,
+    };
+
     const array_length: u32 = try translate.array_length(env, array);
     const packet, const packet_data = switch (operation) {
         inline else => |operation_comptime| blk: {
@@ -279,7 +319,11 @@ fn request(
             // However, the final validation happens in `tb_client` against the runtime-known
             // maximum size.
             if (array_length * @sizeOf(Event) > constants.message_body_size_max) {
-                return request_error(env, .ERR_TOO_MUCH_DATA);
+                return request_error(
+                    env,
+                    client.request_error_ctor_ref,
+                    .ERR_TOO_MUCH_DATA,
+                );
             }
 
             const packet = global_allocator.create(tb_client.Packet) catch {
@@ -301,21 +345,33 @@ fn request(
         },
         .pulse, .get_change_events => unreachable,
     };
+    errdefer {
+        global_allocator.free(packet_data);
+        global_allocator.destroy(packet);
+    }
 
     packet.* = .{
-        .user_data = callback_ref,
+        .user_data = request_context,
         .operation = @intFromEnum(operation),
         .data = packet_data.ptr,
         .data_size = @intCast(packet_data.len),
         .user_tag = 0,
         .status = undefined,
     };
-    client.submit(packet) catch |err| switch (err) {
-        error.ClientInvalid => return request_error(env, .ERR_CLIENT_CLOSED),
+    client.interface.submit(packet) catch |err| switch (err) {
+        error.ClientInvalid => return request_error(
+            env,
+            client.request_error_ctor_ref,
+            .ERR_CLIENT_CLOSED,
+        ),
     };
 }
 
-fn request_error(env: c.napi_env, code: ErrorCodes) translate.Error {
+fn request_error(
+    env: c.napi_env,
+    request_error_ctor_ref: c.napi_ref,
+    code: ErrorCodes,
+) translate.Error {
     return translate.throw_typed_error(env, request_error_ctor_ref, @tagName(code));
 }
 
@@ -411,19 +467,31 @@ fn on_completion_js(
 
     // Extract the remaining packet information from the packet before it's freed.
     const packet_extern: *tb_client.Packet = @ptrCast(@alignCast(packet_argument.?));
-    const callback_ref: c.napi_ref = @ptrCast(@alignCast(packet_extern.user_data.?));
+    const request_context: *RequestContext = @ptrCast(@alignCast(packet_extern.user_data.?));
+    const callback_ref = request_context.callback_ref;
+    defer {
+        translate.delete_reference(env, request_context.request_error_ctor_ref) catch {
+            std.log.warn("Failed to delete RequestError constructor reference.", .{});
+        };
+        global_allocator.destroy(request_context);
+    }
+
+    const packet = packet_extern.cast();
+    defer global_allocator.destroy(packet);
+
+    const buffer: []const u8 = packet.slice();
+    defer global_allocator.free(buffer);
+
+    const handle_scope = open_handle_scope(env) catch return;
+    defer close_handle_scope(env, handle_scope);
+
+    const napi_null = translate.capture_null(env) catch return;
 
     // Decode the packet's Buffer results into an array then free the packet/Buffer.
     const operation: Operation = @enumFromInt(packet_extern.operation);
     const array_or_error = switch (operation) {
         inline else => |operation_comptime| blk: {
             const Result = operation_comptime.ResultType();
-
-            const packet = packet_extern.cast();
-            defer global_allocator.destroy(packet);
-
-            const buffer: []const u8 = packet.slice();
-            defer global_allocator.free(buffer);
 
             switch (packet.status) {
                 .ok => {
@@ -435,19 +503,39 @@ fn on_completion_js(
                     break :blk encode_array(Result, env, results);
                 },
                 .client_shutdown => {
-                    break :blk request_error(env, .ERR_CLIENT_CLOSED);
+                    break :blk request_error(
+                        env,
+                        request_context.request_error_ctor_ref,
+                        .ERR_CLIENT_CLOSED,
+                    );
                 },
                 .client_evicted => {
-                    break :blk request_error(env, .ERR_CLIENT_EVICTED);
+                    break :blk request_error(
+                        env,
+                        request_context.request_error_ctor_ref,
+                        .ERR_CLIENT_EVICTED,
+                    );
                 },
                 .client_release_too_low => {
-                    break :blk request_error(env, .ERR_CLIENT_RELEASE_TOO_LOW);
+                    break :blk request_error(
+                        env,
+                        request_context.request_error_ctor_ref,
+                        .ERR_CLIENT_RELEASE_TOO_LOW,
+                    );
                 },
                 .client_release_too_high => {
-                    break :blk request_error(env, .ERR_CLIENT_RELEASE_TOO_HIGH);
+                    break :blk request_error(
+                        env,
+                        request_context.request_error_ctor_ref,
+                        .ERR_CLIENT_RELEASE_TOO_HIGH,
+                    );
                 },
                 .too_much_data => {
-                    break :blk request_error(env, .ERR_TOO_MUCH_DATA);
+                    break :blk request_error(
+                        env,
+                        request_context.request_error_ctor_ref,
+                        .ERR_TOO_MUCH_DATA,
+                    );
                 },
                 else => unreachable, // all other packet status' handled in previous callback.
             }
@@ -480,6 +568,22 @@ fn on_completion_js(
 
     var args = [_]c.napi_value{ callback_error, callback_result };
     _ = translate.call_function(env, napi_null, callback, &args) catch return;
+}
+
+fn open_handle_scope(env: c.napi_env) !c.napi_handle_scope {
+    var scope: c.napi_handle_scope = undefined;
+    if (c.napi_open_handle_scope(env, &scope) != c.napi_ok) {
+        return translate.throw(env, .{
+            .message = "Failed to open handle scope.",
+        });
+    }
+    return scope;
+}
+
+fn close_handle_scope(env: c.napi_env, scope: c.napi_handle_scope) void {
+    if (c.napi_close_handle_scope(env, scope) != c.napi_ok) {
+        std.log.warn("Failed to close handle scope.", .{});
+    }
 }
 
 // (De)Serialization

@@ -1,4 +1,5 @@
 import assert, { AssertionError } from 'assert'
+import { Worker } from 'node:worker_threads'
 import {
   createClient,
   Account,
@@ -1560,6 +1561,53 @@ test("destroy client in-flight", async (): Promise<void> => {
     assert.strictEqual(err.code,  ErrorCodes.ERR_CLIENT_CLOSED)
     return true
   })
+});
+
+test("destroy client in-flight from worker threads", async (): Promise<void> => {
+  type WorkerResult = {
+    ok: boolean,
+    name?: string,
+    code?: string,
+    message?: string,
+  }
+
+  const script = `
+const { parentPort } = require('node:worker_threads');
+const { createClient, ErrorCodes, RequestError } = require(${JSON.stringify(__dirname)});
+
+const client = createClient({ cluster_id: 92n, replica_addresses: ["99"] });
+setTimeout(() => client.destroy(), 30);
+
+client.lookupAccounts([0n]).then(
+  () => parentPort.postMessage({ ok: false, message: "request resolved" }),
+  (err) => parentPort.postMessage({
+    ok: err instanceof RequestError && err.code === ErrorCodes.ERR_CLIENT_CLOSED,
+    name: err && err.name,
+    code: err && err.code,
+    message: err && err.message,
+  }),
+);
+`
+
+  const runWorker = async (): Promise<void> => {
+    const result = await new Promise<WorkerResult>((resolve, reject) => {
+      const worker = new Worker(script, { eval: true });
+      worker.once('message', (message: WorkerResult) => resolve(message));
+      worker.once('error', reject);
+      worker.once('exit', (code: number) => {
+        if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+      });
+    });
+
+    assert.deepStrictEqual(result, {
+      ok: true,
+      name: 'RequestError',
+      code: ErrorCodes.ERR_CLIENT_CLOSED,
+      message: 'Client was closed.',
+    });
+  }
+
+  await Promise.all([runWorker(), runWorker()])
 });
 
 async function main () {
